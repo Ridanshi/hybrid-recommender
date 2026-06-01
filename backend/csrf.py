@@ -247,3 +247,17 @@ class CSRFMiddleware:
 
         # 7. Both tokens present and identical — pass to the next handler.
         await self._app(scope, receive, send)
+
+
+# ── FastAPI dependency ────────────────────────────────────────────────────────
+
+def csrf_header_dep(request: Request) -> None:
+    """
+    FastAPI dependency that signals CSRF protection is required on a route.
+
+    Actual enforcement is delegated to :class:`CSRFMiddleware`, which validates
+    the Double Submit Cookie pattern before the route handler is invoked.
+    This dependency serves as an explicit marker so route signatures document
+    their CSRF protection requirement and can be selectively overridden in
+    tests.
+    """

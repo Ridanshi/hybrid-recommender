@@ -62,11 +62,20 @@ load_dotenv()
 
 from db import get_supabase, get_supabase_admin
 from backend.auth import _require_admin_access
+from backend.csrf import (
+    CSRFMiddleware,
+    CSRFTokenResponse,
+    csrf_header_dep,
+    generate_csrf_token,
+    set_csrf_cookie,
+)
 from data_adapter import adapt_data, read_file
 from nlp_engine import batch_analyze, aggregate_sentiment_by_item
 from content_model import ContentRecommender
 from collaborative_model import CollaborativeRecommender
 from hybrid_model import HybridRecommender
+
+logger = logging.getLogger(__name__)
 
 # ── App ──────────────────────────────────────────────────────────────
 app = FastAPI(title="Hybrid Recommender API", version="3.0")
@@ -99,6 +108,26 @@ ADMIN_API_TOKEN_ENV = "ADMIN_API_TOKEN"
 _rate_limit_buckets: dict = {}
 _rate_limit_lock = Lock()
 _cache_lock = Lock()
+
+# ── Cross-process model version coordination ──────────────────────────────────
+# Written to Redis after every successful /api/build or model promotion so that
+# Celery workers in separate processes can detect when a new model is available
+# and rebuild their local copy without requiring a restart.
+REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+REDIS_MODEL_VERSION_KEY = "hybrid_recommender:model_version"
+
+
+def _publish_model_version(version: str) -> None:
+    """Write the active model version to Redis so all workers can detect it."""
+    try:
+        r = Redis.from_url(REDIS_URL, socket_connect_timeout=1)
+        r.set(REDIS_MODEL_VERSION_KEY, version)
+        logger.info("Published model version %s to Redis.", version)
+    except Exception as exc:
+        logger.warning(
+            "Could not publish model version to Redis (workers may serve stale models): %s",
+            exc,
+        )
 
 MOCK_PRODUCTS = [
     {
@@ -146,20 +175,11 @@ def _cache_key(*parts: Any) -> str:
 
 
 def _get_cached_response(key: str):
-    try:
-        cached = _redis_client.get(key)
-
-        if cached is not None:
-            return json.loads(cached)
-
-    except (RedisError, json.JSONDecodeError):
-        pass
-
+    global _cache_hits, _cache_misses
     with _cache_lock:
         cached = _response_cache.get(key)
 
         if not cached:
-            global _cache_misses
             _cache_misses += 1
             return None
 
@@ -167,28 +187,18 @@ def _get_cached_response(key: str):
 
         if expires_at <= time.time():
             _response_cache.pop(key, None)
-            global _cache_misses
             _cache_misses += 1
             return None
-        global _cache_hits
         _cache_hits += 1
         return value
 
 
 def _set_cached_response(key: str, value: Any) -> None:
-    with _cache_lock:
-        _response_cache[key] = (time.time() + CACHE_TTL_SECONDS, value)
-        # track misses -> when we set a value it was previously a miss for the next requests
-        # metric updated in _get_cached_response when read.
-
+    try:
+        with _cache_lock:
+            _response_cache[key] = (time.time() + CACHE_TTL_SECONDS, value)
     except (RedisError, TypeError):
         pass
-
-    with _cache_lock:
-        _response_cache[key] = (
-            time.time() + CACHE_TTL_SECONDS,
-            value,
-        )
 
 def _clear_response_cache() -> None:
     with _cache_lock:
@@ -1133,12 +1143,11 @@ def _validate_upload_bytes(filename: str, ext: str, contents: bytes) -> None:
 @app.post("/api/upload")
 async def upload_dataset(
     file: UploadFile = File(...),
-    admin=Depends(_require_admin_access)
+    _csrf: None = Depends(csrf_header_dep),
+    _admin: None = Depends(_admin_access_dep),
 ):
     """Upload a CSV or JSON dataset and import into Supabase."""
     import math
-    _csrf: None = Depends(csrf_header_dep),
-):
     filename = file.filename or "data.csv"
     ext = os.path.splitext(filename)[1].lower()
     if ext not in ('.csv', '.json'):
@@ -1296,6 +1305,8 @@ def build_models(
     models["last_trained_at"] = datetime.now(timezone.utc).isoformat()
     _clear_response_cache()
     precomputed_count = _precompute_recommendation_cache(top_n=10, explain=False)
+    # Signal workers in other processes that a new model is available.
+    _publish_model_version(version)
     return {
         "message": "Models built successfully!",
         "model_version": version,
@@ -1303,7 +1314,7 @@ def build_models(
         "items": len(item_df),
         "has_collaborative": collab_model is not None,
         "build_time_seconds": build_time,
-	"precomputed_recommendations": precomputed_count,
+        "precomputed_recommendations": precomputed_count,
     }
 
 @app.post("/api/train/federated")
@@ -1802,6 +1813,8 @@ def promote_model(
     models["last_trained_at"] = selected["created_at"]
 
     _clear_response_cache()
+    # Signal workers in other processes that a newly promoted model is available.
+    _publish_model_version(version)
 
     return {
         "message": "Model promoted successfully.",
