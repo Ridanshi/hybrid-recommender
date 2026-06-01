@@ -247,3 +247,16 @@ class CSRFMiddleware:
 
         # 7. Both tokens present and identical — pass to the next handler.
         await self._app(scope, receive, send)
+
+
+# ── FastAPI dependency ────────────────────────────────────────────────────────
+
+def csrf_header_dep(request: Request) -> None:
+    """
+    FastAPI dependency that marks a route as requiring CSRF protection.
+
+    Actual token validation is handled by CSRFMiddleware at the ASGI layer
+    before the route handler runs.  This dependency serves as an explicit
+    annotation so that route signatures self-document their CSRF protection
+    requirement and can be selectively overridden in tests.
+    """
